@@ -184,6 +184,23 @@ accepts it is itself a version/build-line fingerprint.
    `4:I[3330,["614","static/chunks/app/dashboard/secret/page-<hash>.js"],"default"]`. Resolve
    them against the origin (re-adding `_next/`) to expand attack surface.
 
+### Proof of Concept
+
+[`poc/next-js.py`](../poc/next-js.py) implements the above end to end — stdlib only, `GET` only,
+no cookies. It walks the full attempt matrix (both leaf modes × both tuple lengths × both key
+modes) for the ancestor claim it is given, and on success prints the equivalent `curl` command
+alongside the recovered body.
+
+```
+poc/next-js.py http://127.0.0.1:3011/dashboard/secret
+poc/next-js.py http://localhost:3000/admin/customers/c1/notes admin customers customerId=c1
+poc/next-js.py --self-test
+```
+
+An ancestor argument is `segment` for a static segment or `param=value` for a dynamic one. With
+no ancestors given, every path segment but the last is claimed as static. `--self-test` asserts
+the emitted wire shapes and key derivations without touching the network.
+
 ---
 
 ## Attempt Space
