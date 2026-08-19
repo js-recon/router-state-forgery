@@ -71,7 +71,7 @@ Serialized application state
 
 ### Next.js
 
-The attack scenario for Next.js is described in [here](<>)
+The attack scenario for Next.js is described in [frameworks/next-js.md](frameworks/next-js.md).
 
 ## Research Questions
 
