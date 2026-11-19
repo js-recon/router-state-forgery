@@ -23,6 +23,11 @@ success signal that distinguishes a real bypass from a redirect. What is not: wh
 routes beyond the `children` slot, catch-all segment types, or the prefetch header family widen
 the primitive (see Open Questions).
 
+A second, related primitive uses the `Next-Url` header instead of the state tree. Next.js serves
+an **intercepting route** defined under a guarded segment through its *public* source route when
+`Next-Url` claims the client is on that segment. The middleware matcher only sees the public URL,
+so middleware guarding the segment never runs (see Intercepting Routes via `Next-Url`).
+
 ---
 
 ## Relevant Mechanisms
@@ -168,16 +173,23 @@ accepts it is itself a version/build-line fingerprint.
    corrected `_rsc` value. That is a cache-key refresh, not the auth check rejecting the forged
    tree.
 
-4. **Read the success signal.** All three must hold:
+4. **Read the success signal.** All four must hold:
 
    - status `200`
    - `content-type` contains `text/x-component`
    - the body does **not** contain `NEXT_REDIRECT`
+   - the body is **not empty**
 
    `NEXT_REDIRECT` is the marker Next.js embeds in a Flight payload when a layout or page calls
    `redirect()`. Its absence is the evidence that the auth check never executed — a 200 alone is
    not, because a redirect is serialized *into* a 200 Flight payload rather than returned as a
    3xx.
+
+   The non-empty check is not redundant. When the forged claim matches all the way down to and
+   including the leaf, the server concludes the client already holds the entire subtree and
+   returns an **empty diff** — a zero-length body that satisfies the first three conditions
+   while disclosing nothing. Treating that as a bypass is a false positive; see the leaf
+   cache-busting note in Attempt Space for how to avoid producing it in the first place.
 
 5. **Harvest the payload.** A bypassed Flight body references JS chunks the plain crawl never
    reached, as `static/chunks/*.js` paths — real payloads omit the `_next/` prefix, e.g.
@@ -194,12 +206,30 @@ alongside the recovered body.
 ```
 poc/next-js.py http://127.0.0.1:3011/dashboard/secret
 poc/next-js.py http://localhost:3000/admin/customers/c1/notes admin customers customerId=c1
+poc/next-js.py --intercept http://localhost:3000/pub/1 /admin
 poc/next-js.py --self-test
 ```
+
+`--intercept <public-url> <next-url-path>` runs the intercepting-route variant for one known pair.
+It fetches the public URL plainly and then with `Next-Url` set, and prints the chunks that only
+the second response references. It does not read `_buildManifest.js`, so take the pair from the
+manifest rules (see Intercepting Routes via `Next-Url`).
 
 An ancestor argument is `segment` for a static segment or `param=value` for a dynamic one. With
 no ancestors given, every path segment but the last is claimed as static. `--self-test` asserts
 the emitted wire shapes and key derivations without touching the network.
+
+It distinguishes a full-body bypass from the weaker metadata-only result, and adds the leaf
+cache-busting param automatically. Both shapes are verified against a Next.js 16.3.0 app:
+
+| Scenario | Claim | Result |
+| --- | --- | --- |
+| Single gate, static ancestor | `admin` (implicit) | full body — customer PII, revenue, discount codes |
+| Two nested gates, dynamic ancestor | `admin customers customerId=c1 notes` | full body — gated support notes |
+| Two nested gates, outer claim only | `admin` | metadata only — discloses nothing sensitive |
+
+The third row is the trap: it reports a technically-successful bypass that leaks nothing. Always
+try the deeper claim before concluding a route is only metadata-exposed.
 
 ---
 
@@ -267,10 +297,83 @@ claim can satisfy the `metadata-only` success check without leaking the actually
 permanently masking a dynamic-ancestor match whose real param name was outside the wordlist.
 Only an already-dynamic-ancestor success is maximally specific.
 
-**Nested gates.** When two ancestor levels each gate access, the claim must extend through both.
-And the real request must carry a query string that differs from the claimed leaf's props (`{}`)
-so the `__PAGE__` leaf mismatches and renders fresh — otherwise the server treats the entire
-subtree *including the leaf* as client-cached and returns an empty diff.
+The harvest round runs once per leaf mode (`page`, then `metadata-only`). It only tries names that
+are not already in the wordlist, and it is capped: js-recon defaults to 20 harvested names
+(`--rsc-param-bruteforce-limit`, where `0` turns the round off).
+
+**Nested gates.** A claim only skips the layouts it actually covers. When more than one level
+gates access, the claim must extend through *every* gated segment — including the one directly
+wrapping the target page. Claiming only the outermost gate leaves the inner layout executing,
+and it still redirects.
+
+This is why the "every segment but the leaf" claim is not always deep enough. For a target like
+`/admin/customers/<id>/notes` gated at both `admin` and `notes`, the claim must cover
+`admin / customers / <id> / notes` — all four — with `__PAGE__` as the leaf beneath them.
+Claiming only `admin / customers / <id>` leaves `notes/layout.tsx` running.
+
+**Leaf cache-busting.** Once the claim extends that far, the request must carry a query string
+that differs from the claimed leaf's props (`{}`), so the `__PAGE__` leaf mismatches and renders
+fresh. Otherwise the server treats the whole claimed subtree *including the leaf* as
+client-cached and returns an empty diff — verified: 200, `text/x-component`, no `NEXT_REDIRECT`,
+and a zero-length body. Adding any extra query parameter is enough, and it is safe to add
+unconditionally: the `_rsc` key is derived from headers only, never from the query string.
+
+---
+
+## Intercepting Routes via `Next-Url`
+
+The layout skip does nothing against middleware. Intercepting routes cover that gap.
+
+### Mechanism
+
+An intercepting route lives under a segment but intercepts a URL outside it, e.g.
+`app/admin/@modal/(..)pub/[id]/page.tsx` intercepts `/pub/<id>` while the client is on `/admin`.
+Next.js compiles it to a `beforeFiles` rewrite that is guarded by a `next-url` header condition:
+
+```js
+{ source: "/pub/:id", destination: "/admin/@modal/(..)pub/:id", has: [{ type: "header", key: "next-url", value: "/admin(?:/.*)?" }] }
+```
+
+The request goes to the public source (`/pub/1`), so the middleware matcher, which sees only the
+public URL, never fires for `/admin`. Setting `Next-Url: /admin` satisfies the guard, and the
+server renders the intercepting route: content that only exists under the protected segment.
+
+A layout `redirect()` on the intercepting branch still runs. This primitive only gets around
+**middleware**, and the layout skip only gets around **layouts**.
+
+### Procedure
+
+1. **Find the rules.** They are in `_buildManifest.js` under `__rewrites.beforeFiles`: any object
+   with `source`, `destination` and a `has` entry `{type: "header", key: "next-url", value}`. The
+   `value` is a regex that Next.js anchors as `^…$`. App Router pages never load this file, so
+   build its URL from the buildId in the landing HTML:
+   `/_next/static/<buildId>/_buildManifest.js`. The buildId is in the Flight root row
+   `0:{"P":null,"b":"<id>"}` (15/16, often escaped inside `__next_f.push`) or in `"buildId":"<id>"` (14).
+2. **Turn a rule into a request.** The destination segment carrying an interception marker
+   (`(.)`, `(..)`, `(..)(..)`, `(...)`) splits it. Everything before that segment is the parent,
+   which becomes the `Next-Url` value. Fill path-to-regexp params (`:id`, `:slug*`) with any literal,
+   and check that the parent still satisfies the guard regex.
+3. **Confirm middleware is the gate.** A plain GET of the parent must answer 3xx **and** show a
+   middleware-only response header: `x-middleware-*`, `x-nextjs-redirect` or `x-nextjs-rewrite`.
+   On 16.x the page path with `x-nextjs-data: 1` returns a bare 307. Only the Pages-style data
+   route `/_next/data/<buildId>/<path>.json` (prefixed with `basePath` if there is one) with
+   `x-nextjs-data: 1` returns `x-nextjs-redirect`, so probe both.
+4. **Issue the request.**
+
+   ```http
+   GET /pub/1
+   Next-Url: /admin
+   ```
+
+   A plain HTML GET: no `RSC` header, no state tree, no `_rsc` key.
+5. **Read the success signal.** The response must be 2xx and reference `static/chunks/*.js` paths
+   that the plain GET of the same public URL does not. Compare them as resolved URLs, so that
+   `_next/static/chunks/x.js` and `static/chunks/x.js` count as one chunk. The new chunks are the
+   intercepting route's code.
+
+Without a manifest (missing, truncated, or answered by a catch-all with HTML), the rules are
+unknown. The only option is to pair every middleware-guarded path with every public page, which
+js-recon caps at 200 pairs.
 
 ---
 
@@ -278,6 +381,8 @@ subtree *including the leaf* as client-cached and returns an empty diff.
 
 - Only affects applications that put authorization logic in a **layout** component. Middleware
   runs earlier in the request lifecycle and is unaffected — this does not bypass middleware.
+  (Middleware-guarded segments that define intercepting routes are covered separately, in
+  Intercepting Routes via `Next-Url`.)
 - Requires knowing or brute-forcing the name of at least one intermediate path segment leading
   to the protected content. The technique does not enumerate segment names by itself; it needs a
   candidate URL from crawling, string extraction, or a wordlist.
@@ -300,6 +405,9 @@ Forged state reveals application structure that a plain unauthenticated crawl ca
   trace in the public bundle
 - Component hierarchy and dependency references in the payload
 - Acceptance of the legacy `_rsc` key as a build-line fingerprint
+- Middleware response headers (`x-middleware-*`, `x-nextjs-redirect`, `x-nextjs-rewrite`) that
+  show which paths middleware guards
+- Intercepting-route chunks served through a public URL with a forged `Next-Url`
 
 ### RSF-2: State Disclosure
 
@@ -337,7 +445,9 @@ primitive. See the local source-validation handoff notes.
 - **Legacy key acceptance.** Is dual-accept a real server-side path, or does the server simply
   ignore a mismatched key? The latter would make the "legacy accepted" fingerprint meaningless.
 - **`Next-Url` semantics.** What does the server use it for, and must it be consistent with the
-  forged tree, or is it free-form?
+  forged tree, or is it free-form? Partly answered: it satisfies the `has: next-url` guard on
+  intercepting-route rewrites (see Intercepting Routes via `Next-Url`). Its role in the state-tree
+  request beyond the `_rsc` key input is still unconfirmed.
 - **Tuple-length boundary.** The 16.2.6 / 16.3.0 split needs confirmation by diffing
   `flightRouterStateSchema` between release tags.
 
@@ -361,5 +471,21 @@ Applications should:
 This document describes the Next.js-specific implementation only. The general Router State
 Forgery definition is maintained in the root research document.
 
-The mechanism described here is implemented as a black-box crawl technique in
-`js-recon/src/lazyLoad/next_js/next_routerStateForge.ts`.
+The mechanisms described here are implemented as black-box lazyload methods in
+`js-recon/src/lazyLoad/next_js/next_rsf/`. `index.ts` runs them in order, and `rsfShared.ts`
+holds the state-tree, `_rsc` key and fallback plumbing. Each one can be selected with
+`--include-methods` / `--exclude-methods`:
+
+| Concept in this document | js-recon method | Result key(s) |
+| --- | --- | --- |
+| Static ancestor claims (full chain, first segment only) | `next_rsfAncestorClaim` | `next_rsfAncestorClaim`, `next_rsfAncestorClaim_metadataOnly` |
+| Dynamic-ancestor guesses + harvest round | `next_rsfParamBruteforce` | `next_rsfParamBruteforce`, `next_rsfParamBruteforce_metadataOnly` |
+| Legacy `_rsc` key accepted (fingerprint) | — (either of the above) | `next_rsf_legacyKeyAccepted` |
+| Intercepting routes via `Next-Url` | `next_interceptRouteNextUrl` | `next_interceptRouteNextUrl` |
+
+The old single `next_routerStateForge` method name is gone. Candidate URLs come from the crawl,
+from `strings`' `extracted_urls.json`, and from `--wordlist`.
+
+This document is ahead of the tool in two places: js-recon does not yet require a non-empty
+body, and it does not add the leaf cache-busting param (see Exploitation Procedure step 4 and
+Attempt Space).

